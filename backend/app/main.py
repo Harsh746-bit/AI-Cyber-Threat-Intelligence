@@ -3,11 +3,13 @@ from fastapi import FastAPI, Depends, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 
 from backend.app.schemas.security_event import SecurityEvent
 from backend.app.services.detection import analyze_event
 from backend.app.db.database import Base, engine, SessionLocal
 from backend.app.models.incident import Incident
+from backend.app.models.security_event import SecurityEventRecord
 
 
 app = FastAPI(
@@ -28,6 +30,7 @@ app.add_middleware(
 )
 
 
+# Register imported models and create missing database tables.
 Base.metadata.create_all(bind=engine)
 
 
@@ -66,18 +69,67 @@ def health_check():
 # -------------------- SECURITY EVENT INGESTION --------------------
 
 @app.post("/api/v1/events", status_code=202)
-def ingest_security_event(event: SecurityEvent):
-    """
-    Validate and acknowledge an incoming security event.
+def ingest_security_event(
+    event: SecurityEvent,
+    db: Session = Depends(get_db),
+):
+    event_id = str(event.event_id)
 
-    This endpoint does not persist the event or run ML detection yet.
-    """
+    # Reject an event ID that has already been stored.
+    existing_event = (
+        db.query(SecurityEventRecord)
+        .filter(SecurityEventRecord.event_id == event_id)
+        .first()
+    )
+
+    if existing_event is not None:
+        raise HTTPException(
+            status_code=409,
+            detail="An event with this event_id already exists.",
+        )
+
+    event_record = SecurityEventRecord(
+        event_id=event_id,
+        schema_version=event.schema_version,
+        event_type=event.event_type,
+        observed_at=event.observed_at,
+        source_ip=event.source_ip,
+        destination_ip=event.destination_ip,
+        source_port=event.source_port,
+        destination_port=event.destination_port,
+        protocol=(
+            str(event.protocol)
+            if event.protocol is not None
+            else None
+        ),
+        features=event.features,
+    )
+
+    try:
+        db.add(event_record)
+        db.commit()
+        db.refresh(event_record)
+
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail="An event with this event_id already exists.",
+        )
+
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to persist the security event.",
+        )
+
     return {
         "status": "accepted",
-        "event_id": str(event.event_id),
-        "event_type": event.event_type,
-        "schema_version": event.schema_version,
-        "message": "Security event passed validation.",
+        "event_id": event_record.event_id,
+        "event_type": event_record.event_type,
+        "schema_version": event_record.schema_version,
+        "message": "Security event validated and persisted.",
     }
 
 
@@ -97,9 +149,17 @@ def analyze_security_event(
         reasons="; ".join(result["reasons"]),
     )
 
-    db.add(incident)
-    db.commit()
-    db.refresh(incident)
+    try:
+        db.add(incident)
+        db.commit()
+        db.refresh(incident)
+
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to save the incident.",
+        )
 
     return {
         "incident_id": incident.id,
@@ -207,8 +267,16 @@ def update_incident_status(
 
     incident.status = new_status
 
-    db.commit()
-    db.refresh(incident)
+    try:
+        db.commit()
+        db.refresh(incident)
+
+    except SQLAlchemyError:
+        db.rollback()
+        raise HTTPException(
+            status_code=500,
+            detail="Failed to update the incident status.",
+        )
 
     return {
         "incident_id": incident.id,
