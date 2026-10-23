@@ -1,9 +1,10 @@
 
 from fastapi import FastAPI, Depends, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel, Field
+from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
+from backend.app.schemas.security_event import SecurityEvent
 from backend.app.services.detection import analyze_event
 from backend.app.db.database import Base, engine, SessionLocal
 from backend.app.models.incident import Incident
@@ -11,7 +12,7 @@ from backend.app.models.incident import Incident
 
 app = FastAPI(
     title="AI Cyber Threat Intelligence Platform",
-    version="0.1.0"
+    version="0.1.0",
 )
 
 
@@ -31,13 +32,6 @@ Base.metadata.create_all(bind=engine)
 
 
 # -------------------- REQUEST MODELS --------------------
-
-class SecurityEvent(BaseModel):
-    source_ip: str
-    failed_logins: int = Field(default=0, ge=0)
-    requests_per_minute: int = Field(default=0, ge=0)
-    known_malicious_ip: bool = False
-
 
 class IncidentStatusUpdate(BaseModel):
     status: str
@@ -69,20 +63,38 @@ def health_check():
     }
 
 
+# -------------------- SECURITY EVENT INGESTION --------------------
+
+@app.post("/api/v1/events", status_code=202)
+def ingest_security_event(event: SecurityEvent):
+    """
+    Validate and acknowledge an incoming security event.
+
+    This endpoint does not persist the event or run ML detection yet.
+    """
+    return {
+        "status": "accepted",
+        "event_id": str(event.event_id),
+        "event_type": event.event_type,
+        "schema_version": event.schema_version,
+        "message": "Security event passed validation.",
+    }
+
+
 # -------------------- ANALYZE SECURITY EVENT --------------------
 
 @app.post("/api/v1/analyze")
 def analyze_security_event(
     event: SecurityEvent,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     result = analyze_event(event)
 
     incident = Incident(
-        source_ip=event.source_ip,
+        source_ip=event.source_ip or "UNKNOWN",
         risk_score=result["risk_score"],
         severity=result["severity"],
-        reasons="; ".join(result["reasons"])
+        reasons="; ".join(result["reasons"]),
     )
 
     db.add(incident)
@@ -96,7 +108,7 @@ def analyze_security_event(
         "severity": incident.severity,
         "status": incident.status,
         "reasons": result["reasons"],
-        "analysis_type": "rule_based_prototype"
+        "analysis_type": "rule_based_prototype",
     }
 
 
@@ -107,7 +119,7 @@ def get_incidents(
     limit: int = Query(default=20, ge=1, le=100),
     severity: str | None = Query(default=None),
     search: str | None = Query(default=None),
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     query = db.query(Incident)
 
@@ -117,7 +129,7 @@ def get_incidents(
         if severity_value not in ["LOW", "MEDIUM", "HIGH"]:
             raise HTTPException(
                 status_code=400,
-                detail="Severity must be LOW, MEDIUM, or HIGH"
+                detail="Severity must be LOW, MEDIUM, or HIGH",
             )
 
         query = query.filter(
@@ -152,10 +164,10 @@ def get_incidents(
                 "severity": incident.severity,
                 "status": incident.status,
                 "reasons": incident.reasons,
-                "created_at": incident.created_at
+                "created_at": incident.created_at,
             }
             for incident in incidents
-        ]
+        ],
     }
 
 
@@ -165,12 +177,12 @@ def get_incidents(
 def update_incident_status(
     incident_id: int,
     update: IncidentStatusUpdate,
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     allowed_statuses = [
         "OPEN",
         "INVESTIGATING",
-        "RESOLVED"
+        "RESOLVED",
     ]
 
     new_status = update.status.strip().upper()
@@ -178,7 +190,7 @@ def update_incident_status(
     if new_status not in allowed_statuses:
         raise HTTPException(
             status_code=400,
-            detail="Status must be OPEN, INVESTIGATING, or RESOLVED"
+            detail="Status must be OPEN, INVESTIGATING, or RESOLVED",
         )
 
     incident = (
@@ -190,7 +202,7 @@ def update_incident_status(
     if incident is None:
         raise HTTPException(
             status_code=404,
-            detail="Incident not found"
+            detail="Incident not found",
         )
 
     incident.status = new_status
@@ -201,7 +213,7 @@ def update_incident_status(
     return {
         "incident_id": incident.id,
         "status": incident.status,
-        "message": "Incident status updated successfully"
+        "message": "Incident status updated successfully",
     }
 
 
@@ -209,7 +221,7 @@ def update_incident_status(
 
 @app.get("/api/v1/incidents/summary")
 def get_incident_summary(
-    db: Session = Depends(get_db)
+    db: Session = Depends(get_db),
 ):
     total = db.query(Incident).count()
 
@@ -242,7 +254,7 @@ def get_incident_summary(
         "severity_breakdown": {
             "LOW": low,
             "MEDIUM": medium,
-            "HIGH": high
+            "HIGH": high,
         },
-        "status_breakdown": status_breakdown
+        "status_breakdown": status_breakdown,
     }
