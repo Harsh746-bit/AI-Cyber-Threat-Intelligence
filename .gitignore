@@ -1,4 +1,3 @@
-
 # Python virtual environments
 .venv/
 venv/
@@ -14,19 +13,35 @@ __pycache__/
 .env.*
 !.env.example
 
-# Local databases
+# Local databases and temporary files
 *.db
+*.db-wal
+*.db-shm
+*.db-journal
 *.sqlite
 *.sqlite3
+
+# Runtime logs
+logs/
+*.log
+*.jsonl
+
+# Scratch and test scripts
+test_ml_classes.py
+migrate_incidents.py
+
+# Large ML dataset files
+ml/artifacts/*.csv
+ml/datasets/
 
 # Frontend dependencies and build output
 node_modules/
 dist/
 build/
 
-# Logs and editor files
-*.log
+# Editor and OS files
 .vscode/
+.idea/
 .DS_Store
 Thumbs.db
 

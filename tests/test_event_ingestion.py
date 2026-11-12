@@ -52,7 +52,7 @@ def test_db():
 
 @pytest.fixture
 def client(test_db):
-    with TestClient(app) as test_client:
+    with TestClient(app, headers={"X-SENTRIX-SENSOR-KEY": "sentrix-test-isolated-sensor-key-32chars!"}) as test_client:
         yield test_client
 
 

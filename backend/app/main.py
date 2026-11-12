@@ -1,328 +1,177 @@
-
-from fastapi import FastAPI, Depends, Query, HTTPException
+import os
+from pathlib import Path
+from fastapi import FastAPI, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
-from sqlalchemy.orm import Session
-from sqlalchemy.exc import IntegrityError, SQLAlchemyError
+from fastapi.responses import FileResponse
+from fastapi.staticfiles import StaticFiles
 
-from backend.app.schemas.security_event import SecurityEvent
-from backend.app.services.detection import analyze_event
-from backend.app.db.database import Base, engine, SessionLocal
-from backend.app.models.incident import Incident
-from backend.app.models.security_event import SecurityEventRecord
-
-
-app = FastAPI(
-    title="AI Cyber Threat Intelligence Platform",
-    version="0.1.0",
+from backend.app.db.database import (
+    Base,
+    SessionLocal,
+    engine,
+    ensure_schema_migrations,
+    get_db,
+)
+from backend.app.routers.auth import (
+    LoginRequest,
+    router as auth_router,
+)
+from backend.app.routers.events import (
+    RawIngestRequest,
+    router as events_router,
+)
+from backend.app.routers.incidents import (
+    AddNoteRequest,
+    AssignIncidentRequest,
+    IncidentStatusUpdate,
+    router as incidents_router,
+)
+from backend.app.routers.ml import (
+    MLPredictionRequest,
+    router as ml_router,
+)
+from backend.app.routers.responses import (
+    CreateResponseActionRequest,
+    router as responses_router,
+)
+from backend.app.services.auth import seed_default_users
+from backend.app.services.ingestion_pipeline import (
+    auto_propose_response_action,
+    incident_to_dict,
+    response_to_dict,
+    severity_from_score,
 )
 
+# Re-exports for backwards compatibility
+__all__ = [
+    "app",
+    "get_db",
+    "auto_propose_response_action",
+    "incident_to_dict",
+    "response_to_dict",
+    "severity_from_score",
+    "LoginRequest",
+    "IncidentStatusUpdate",
+    "AddNoteRequest",
+    "AssignIncidentRequest",
+    "CreateResponseActionRequest",
+    "RawIngestRequest",
+    "MLPredictionRequest",
+]
+
+app = FastAPI(
+    title="SENTRIX - AI Cyber Threat Intelligence Platform",
+    version="0.2.0",
+    description="Security event ingestion, ML threat detection, and incident management.",
+)
+
+def get_cors_origins() -> list[str]:
+    raw = os.getenv("SENTRIX_CORS_ORIGINS", "").strip()
+    is_prod = (os.getenv("SENTRIX_ENV") or os.getenv("APP_ENV") or "").lower() in ("production", "prod")
+    if raw:
+        origins = [o.strip() for o in raw.split(",") if o.strip()]
+        if "*" in origins:
+            raise ValueError("CORS wildcard origin '*' is strictly prohibited when credentials are enabled")
+        return origins
+    if is_prod:
+        raise ValueError("SENTRIX_CORS_ORIGINS must be explicitly configured in production mode")
+    return ["http://localhost:5173", "http://127.0.0.1:5173"]
+
+
+cors_origins = get_cors_origins()
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "http://localhost:5173",
-        "http://127.0.0.1:5173",
-    ],
+    allow_origins=cors_origins,
     allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PATCH", "DELETE", "OPTIONS"],
+    allow_headers=["Content-Type", "Authorization", "X-SENTRIX-SENSOR-KEY", "X-SENTRIX-CSRF"],
 )
 
 
-# Register imported models and create missing database tables.
+def is_trusted_proxy(client_host: str | None) -> bool:
+    if not client_host:
+        return False
+    raw_proxies = os.getenv("SENTRIX_TRUSTED_PROXIES", "127.0.0.1,::1,testclient").strip()
+    trusted = {p.strip() for p in raw_proxies.split(",") if p.strip()}
+    return client_host in trusted
+
+
+def should_apply_hsts(request: Request) -> bool:
+    """
+    Enforces HSTS only when connections are confirmed HTTPS.
+    Forwarded headers are only honored when originating from a trusted reverse proxy.
+    """
+    if request.url.scheme == "https":
+        return True
+    forwarded_proto = request.headers.get("x-forwarded-proto")
+    if forwarded_proto and forwarded_proto.lower() == "https":
+        client_host = request.client.host if request.client else None
+        return is_trusted_proxy(client_host)
+    return False
+
+
+@app.middleware("http")
+async def add_security_headers(request: Request, call_next):
+    response = await call_next(request)
+    response.headers["X-Content-Type-Options"] = "nosniff"
+    response.headers["X-Frame-Options"] = "DENY"
+    response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+
+    if should_apply_hsts(request):
+        include_subdomains = os.getenv("SENTRIX_HSTS_INCLUDE_SUBDOMAINS", "0").lower() in ("1", "true", "yes")
+        hsts_header = "max-age=31536000; includeSubDomains" if include_subdomains else "max-age=31536000"
+        response.headers["Strict-Transport-Security"] = hsts_header
+
+    return response
+
+# Register models and create missing tables.
 Base.metadata.create_all(bind=engine)
+ensure_schema_migrations(engine)
+try:
+    with SessionLocal() as _seed_db:
+        seed_default_users(_seed_db)
+except ValueError as val_err:
+    # Fail fast if invalid production configuration
+    if (os.getenv("SENTRIX_ENV") or os.getenv("APP_ENV") or "").lower() in ("production", "prod"):
+        raise
+except Exception:
+    pass
 
+# Mount modular API routers
+app.include_router(auth_router)
+app.include_router(incidents_router)
+app.include_router(responses_router)
+app.include_router(events_router)
+app.include_router(ml_router)
 
-# -------------------- REQUEST MODELS --------------------
-
-class IncidentStatusUpdate(BaseModel):
-    status: str
-
-
-# -------------------- DATABASE SESSION --------------------
-
-def get_db():
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        db.close()
-
-
-# -------------------- BASIC ENDPOINTS --------------------
 
 @app.get("/")
 def home():
     return {
-        "message": "Our Cybersecurity Platform is running!"
+        "message": "SENTRIX is running.",
+        "tagline": "Intelligence That Defends.",
     }
 
 
 @app.get("/health")
 def health_check():
-    return {
-        "status": "healthy"
-    }
+    return {"status": "healthy"}
 
 
-# -------------------- SECURITY EVENT INGESTION --------------------
+# ============================================================================
+# Production Static SPA Mounting (Container & Deployment)
+# ============================================================================
+DIST_DIR = Path(__file__).resolve().parent.parent.parent / "frontend" / "dist"
+if (DIST_DIR / "index.html").is_file() and os.getenv("SENTRIX_SERVE_STATIC", "0") == "1":
+    if (DIST_DIR / "assets").is_dir():
+        app.mount("/assets", StaticFiles(directory=str(DIST_DIR / "assets")), name="static_assets")
 
-@app.post("/api/v1/events", status_code=202)
-def ingest_security_event(
-    event: SecurityEvent,
-    db: Session = Depends(get_db),
-):
-    event_id = str(event.event_id)
-
-    # Reject an event ID that has already been stored.
-    existing_event = (
-        db.query(SecurityEventRecord)
-        .filter(SecurityEventRecord.event_id == event_id)
-        .first()
-    )
-
-    if existing_event is not None:
-        raise HTTPException(
-            status_code=409,
-            detail="An event with this event_id already exists.",
-        )
-
-    event_record = SecurityEventRecord(
-        event_id=event_id,
-        schema_version=event.schema_version,
-        event_type=event.event_type,
-        observed_at=event.observed_at,
-        source_ip=event.source_ip,
-        destination_ip=event.destination_ip,
-        source_port=event.source_port,
-        destination_port=event.destination_port,
-        protocol=(
-            str(event.protocol)
-            if event.protocol is not None
-            else None
-        ),
-        features=event.features,
-    )
-
-    try:
-        db.add(event_record)
-        db.commit()
-        db.refresh(event_record)
-
-    except IntegrityError:
-        db.rollback()
-        raise HTTPException(
-            status_code=409,
-            detail="An event with this event_id already exists.",
-        )
-
-    except SQLAlchemyError:
-        db.rollback()
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to persist the security event.",
-        )
-
-    return {
-        "status": "accepted",
-        "event_id": event_record.event_id,
-        "event_type": event_record.event_type,
-        "schema_version": event_record.schema_version,
-        "message": "Security event validated and persisted.",
-    }
-
-
-# -------------------- ANALYZE SECURITY EVENT --------------------
-
-@app.post("/api/v1/analyze")
-def analyze_security_event(
-    event: SecurityEvent,
-    db: Session = Depends(get_db),
-):
-    result = analyze_event(event)
-
-    incident = Incident(
-        source_ip=event.source_ip or "UNKNOWN",
-        risk_score=result["risk_score"],
-        severity=result["severity"],
-        reasons="; ".join(result["reasons"]),
-    )
-
-    try:
-        db.add(incident)
-        db.commit()
-        db.refresh(incident)
-
-    except SQLAlchemyError:
-        db.rollback()
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to save the incident.",
-        )
-
-    return {
-        "incident_id": incident.id,
-        "source_ip": incident.source_ip,
-        "risk_score": incident.risk_score,
-        "severity": incident.severity,
-        "status": incident.status,
-        "reasons": result["reasons"],
-        "analysis_type": "rule_based_prototype",
-    }
-
-
-# -------------------- LIST, SEARCH AND FILTER INCIDENTS --------------------
-
-@app.get("/api/v1/incidents")
-def get_incidents(
-    limit: int = Query(default=20, ge=1, le=100),
-    severity: str | None = Query(default=None),
-    search: str | None = Query(default=None),
-    db: Session = Depends(get_db),
-):
-    query = db.query(Incident)
-
-    if severity:
-        severity_value = severity.strip().upper()
-
-        if severity_value not in ["LOW", "MEDIUM", "HIGH"]:
-            raise HTTPException(
-                status_code=400,
-                detail="Severity must be LOW, MEDIUM, or HIGH",
-            )
-
-        query = query.filter(
-            Incident.severity == severity_value
-        )
-
-    if search:
-        search_value = search.strip()
-
-        if search_value.isdigit():
-            query = query.filter(
-                Incident.id == int(search_value)
-            )
-        elif search_value:
-            query = query.filter(
-                Incident.source_ip.contains(search_value)
-            )
-
-    incidents = (
-        query.order_by(Incident.id.desc())
-        .limit(limit)
-        .all()
-    )
-
-    return {
-        "total_returned": len(incidents),
-        "incidents": [
-            {
-                "incident_id": incident.id,
-                "source_ip": incident.source_ip,
-                "risk_score": incident.risk_score,
-                "severity": incident.severity,
-                "status": incident.status,
-                "reasons": incident.reasons,
-                "created_at": incident.created_at,
-            }
-            for incident in incidents
-        ],
-    }
-
-
-# -------------------- UPDATE INCIDENT INVESTIGATION STATUS --------------------
-
-@app.patch("/api/v1/incidents/{incident_id}/status")
-def update_incident_status(
-    incident_id: int,
-    update: IncidentStatusUpdate,
-    db: Session = Depends(get_db),
-):
-    allowed_statuses = [
-        "OPEN",
-        "INVESTIGATING",
-        "RESOLVED",
-    ]
-
-    new_status = update.status.strip().upper()
-
-    if new_status not in allowed_statuses:
-        raise HTTPException(
-            status_code=400,
-            detail="Status must be OPEN, INVESTIGATING, or RESOLVED",
-        )
-
-    incident = (
-        db.query(Incident)
-        .filter(Incident.id == incident_id)
-        .first()
-    )
-
-    if incident is None:
-        raise HTTPException(
-            status_code=404,
-            detail="Incident not found",
-        )
-
-    incident.status = new_status
-
-    try:
-        db.commit()
-        db.refresh(incident)
-
-    except SQLAlchemyError:
-        db.rollback()
-        raise HTTPException(
-            status_code=500,
-            detail="Failed to update the incident status.",
-        )
-
-    return {
-        "incident_id": incident.id,
-        "status": incident.status,
-        "message": "Incident status updated successfully",
-    }
-
-
-# -------------------- INCIDENT DASHBOARD SUMMARY --------------------
-
-@app.get("/api/v1/incidents/summary")
-def get_incident_summary(
-    db: Session = Depends(get_db),
-):
-    total = db.query(Incident).count()
-
-    low = db.query(Incident).filter(
-        Incident.severity == "LOW"
-    ).count()
-
-    medium = db.query(Incident).filter(
-        Incident.severity == "MEDIUM"
-    ).count()
-
-    high = db.query(Incident).filter(
-        Incident.severity == "HIGH"
-    ).count()
-
-    status_breakdown = {
-        "OPEN": db.query(Incident).filter(
-            Incident.status == "OPEN"
-        ).count(),
-        "INVESTIGATING": db.query(Incident).filter(
-            Incident.status == "INVESTIGATING"
-        ).count(),
-        "RESOLVED": db.query(Incident).filter(
-            Incident.status == "RESOLVED"
-        ).count(),
-    }
-
-    return {
-        "total_incidents": total,
-        "severity_breakdown": {
-            "LOW": low,
-            "MEDIUM": medium,
-            "HIGH": high,
-        },
-        "status_breakdown": status_breakdown,
-    }
+    @app.get("/{full_path:path}")
+    def serve_frontend_spa(full_path: str):
+        if full_path.startswith("api/") or full_path == "health":
+            raise HTTPException(status_code=404, detail="Not Found")
+        target_file = DIST_DIR / full_path
+        if target_file.is_file():
+            return FileResponse(target_file)
+        return FileResponse(DIST_DIR / "index.html")

@@ -1,0 +1,34 @@
+version: '3.8'
+
+services:
+  sentrix:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: sentrix-soc-platform
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - HOST=0.0.0.0
+      - PORT=8000
+      - SENTRIX_SERVE_STATIC=1
+      - SENTRIX_ENV=production
+      - JWT_SECRET=${JWT_SECRET}
+      - ADMIN_INITIAL_PASSWORD=${ADMIN_INITIAL_PASSWORD}
+      - ANALYST_INITIAL_PASSWORD=${ANALYST_INITIAL_PASSWORD}
+      - SENTRIX_SENSOR_API_KEY=${SENTRIX_SENSOR_API_KEY}
+      - DATABASE_URL=sqlite:////app/data/cyber_threats.db
+      - SENTRIX_PROTECTED_CIDRS=${SENTRIX_PROTECTED_CIDRS:-}
+    volumes:
+      - sentrix-data:/app/data
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+volumes:
+  sentrix-data:
+    name: sentrix-data-volume
